@@ -80,11 +80,6 @@
 typedef struct {
 	/* Guest fd numbers we are emulating. -1 = free slot. */
 	int fds[FAKE_NETLINK_MAX_FDS];
-	/* The OTHER end of the socketpair backing each slot. Never read or
-	 * written -- recv is emulated at enter, so no data ever has to flow --
-	 * but kept recorded, and kept OPEN in the guest, because closing it
-	 * would make the guest's own end report EOF/hangup to any poller. */
-	int peer_fds[FAKE_NETLINK_MAX_FDS];
 	/* Sequence number and pid from the last request seen on each fd, so
 	 * the reply we synthesise echoes them back. A netlink client matches
 	 * replies on these; returning zeros makes well-written clients
@@ -145,12 +140,11 @@ static int slot_of(const FakeNetlinkConfig *cfg, int fd)
 	return -1;
 }
 
-static int claim_slot(FakeNetlinkConfig *cfg, int fd, int peer)
+static int claim_slot(FakeNetlinkConfig *cfg, int fd)
 {
 	for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) {
 		if (cfg->fds[i] == -1) {
 			cfg->fds[i] = fd;
-			cfg->peer_fds[i] = peer;
 			cfg->last_seq[i] = 0;
 			cfg->last_pid[i] = 0;
 			cfg->last_type[i] = 0;
@@ -185,14 +179,6 @@ static void note_request(Tracee *tracee, FakeNetlinkConfig *cfg, int slot,
 	cfg->last_type[slot] = hdr.nlmsg_type;
 }
 
-/**
- * Write a bare NLMSG_DONE into the guest's receive buffer — the wire form of
- * "that is the entire answer, and it is empty".
- *
- * Returns the number of bytes written, or a negative errno. A buffer too
- * small for a single header gets EINVAL rather than a truncated message,
- * because a partial nlmsghdr is not something a caller can parse.
- */
 /* Helper: append one attribute to a netlink message buffer. */
 static size_t put_attr(char *p, size_t off, uint16_t type,
 		       const void *val, size_t vlen)
@@ -376,7 +362,11 @@ static void adopt_socket_exit(Tracee *tracee, FakeNetlinkConfig *cfg)
 		return;
 	}
 
-	slot = claim_slot(cfg, pair[0], pair[1]);
+	/* pair[1] is deliberately left OPEN in the guest and not
+	 * tracked: nothing ever reads or writes it (recv is emulated at
+	 * enter, so no data has to flow), but closing it would make the
+	 * guest's own end report EOF/hangup to any poller. */
+	slot = claim_slot(cfg, pair[0]);
 	if (slot < 0) {
 		/* Table full — refuse rather than hand back a socket we will
 		 * not recognise later and would therefore emulate wrongly. */
@@ -446,7 +436,6 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 
 			for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) {
 			cfg->fds[i] = -1;
-			cfg->peer_fds[i] = -1;
 			cfg->is_monitor[i] = false;
 		}
 
@@ -454,7 +443,7 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 		extension->filtered_sysnums = filtered_sysnums;
 
 		note(NULL, INFO, INTERNAL,
-		     "fake_netlink: initialized (rtnetlink → empty list; SO_MARK → no-op)");
+		     "fake_netlink: initialized (rtnetlink → loopback only; SO_MARK → no-op)");
 		return 0;
 	}
 
