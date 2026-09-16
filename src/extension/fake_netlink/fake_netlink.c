@@ -57,6 +57,9 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/if.h>
+#include <linux/if_arp.h>
+#include <linux/if_addr.h>
 #include <talloc.h>
 
 #include "extension/fake_netlink/fake_netlink.h"
@@ -88,6 +91,10 @@ typedef struct {
 	 * (including Go's) discard the answer as unsolicited. */
 	uint32_t last_seq[FAKE_NETLINK_MAX_FDS];
 	uint32_t last_pid[FAKE_NETLINK_MAX_FDS];
+	/* nlmsg_type of the last request, so the reply can describe the right
+	 * thing (a GETLINK dump answers with RTM_NEWLINK, GETADDR with
+	 * RTM_NEWADDR). */
+	uint16_t last_type[FAKE_NETLINK_MAX_FDS];
 	/* [T-android-fake-netlink-monitor] True when bind() asked for multicast
 	 * groups, i.e. this is an EVENT-SUBSCRIPTION socket rather than a
 	 * request/response one. The two need opposite treatment on recv --
@@ -146,6 +153,7 @@ static int claim_slot(FakeNetlinkConfig *cfg, int fd, int peer)
 			cfg->peer_fds[i] = peer;
 			cfg->last_seq[i] = 0;
 			cfg->last_pid[i] = 0;
+			cfg->last_type[i] = 0;
 			cfg->is_monitor[i] = false;
 			return i;
 		}
@@ -174,6 +182,7 @@ static void note_request(Tracee *tracee, FakeNetlinkConfig *cfg, int slot,
 
 	cfg->last_seq[slot] = hdr.nlmsg_seq;
 	cfg->last_pid[slot] = hdr.nlmsg_pid;
+	cfg->last_type[slot] = hdr.nlmsg_type;
 }
 
 /**
@@ -184,32 +193,128 @@ static void note_request(Tracee *tracee, FakeNetlinkConfig *cfg, int slot,
  * small for a single header gets EINVAL rather than a truncated message,
  * because a partial nlmsghdr is not something a caller can parse.
  */
-static int emit_done(Tracee *tracee, const FakeNetlinkConfig *cfg, int slot,
-		     word_t buf, word_t len)
+/* Helper: append one attribute to a netlink message buffer. */
+static size_t put_attr(char *p, size_t off, uint16_t type,
+		       const void *val, size_t vlen)
 {
+	struct rtattr *rta = (struct rtattr *) (p + off);
+	rta->rta_type = type;
+	rta->rta_len = RTA_LENGTH(vlen);
+	memcpy(RTA_DATA(rta), val, vlen);
+	return off + RTA_ALIGN(rta->rta_len);
+}
+
+/**
+ * Build the reply to an RTM_GETLINK / RTM_GETADDR dump.
+ *
+ * [T-android-fake-netlink-loopback] This reports a LOOPBACK interface rather
+ * than nothing, and that choice is the whole point.
+ *
+ * The first version answered every dump with a bare NLMSG_DONE — an empty
+ * interface list. That was enough to get net.Interfaces() to succeed, but it
+ * is also, to a networking stack, a machine with no connectivity at all.
+ * tsnet read it exactly that way on device:
+ *
+ *   link state: interfaces.State{defaultRoute= ifs={} v4=false v6=false}
+ *   magicsock: SetNetworkUp(false)
+ *   control: setPaused(true)
+ *   control: authRoutine: awaiting unpause    <- forever
+ *
+ * so the control client never dialled out and no login URL was ever produced.
+ * "Honest" emptiness turned out to be the thing that blocked it.
+ *
+ * A loopback interface with 127.0.0.1 is the smallest answer that is both
+ * TRUE (the sandbox really can talk to itself, and outbound TCP/UDP genuinely
+ * work here — verified by resolving login.tailscale.com and completing an
+ * HTTPS request from inside) and sufficient for a stack to consider itself
+ * up. We deliberately do NOT invent an ethernet interface with a made-up
+ * address: a caller that tried to bind or advertise it would fail later and
+ * more confusingly, which is the failure mode this whole extension exists to
+ * avoid.
+ */
+static int emit_dump_reply(Tracee *tracee, const FakeNetlinkConfig *cfg,
+			   int slot, word_t buf, word_t len)
+{
+	/* One message plus NLMSG_DONE; generous headroom for alignment. */
+	char msg[512];
+	size_t off = 0;
+	uint16_t req = slot >= 0 ? cfg->last_type[slot] : 0;
+	uint32_t seq = slot >= 0 ? cfg->last_seq[slot] : 0;
+	struct nlmsghdr *nh;
 	struct nlmsghdr done;
 
-	if (len < NLMSG_HDRLEN) return -EINVAL;
+	memset(msg, 0, sizeof(msg));
 
+	if (req == RTM_GETLINK) {
+		struct ifinfomsg ifi;
+		const char *name = "lo";
+		uint32_t mtu = 65536;
+		/* 00:00:00:00:00:00 — loopback has no meaningful MAC. */
+		char mac[6] = { 0 };
+
+		memset(&ifi, 0, sizeof(ifi));
+		ifi.ifi_family = AF_UNSPEC;
+		ifi.ifi_type = ARPHRD_LOOPBACK;
+		ifi.ifi_index = 1;
+		ifi.ifi_flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+		ifi.ifi_change = 0xFFFFFFFF;
+
+		nh = (struct nlmsghdr *) msg;
+		nh->nlmsg_type = RTM_NEWLINK;
+		nh->nlmsg_flags = NLM_F_MULTI;
+		nh->nlmsg_seq = seq;
+		nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
+		memcpy(NLMSG_DATA(nh), &ifi, sizeof(ifi));
+		off = NLMSG_LENGTH(sizeof(ifi));
+		off = put_attr(msg, off, IFLA_IFNAME, name, strlen(name) + 1);
+		off = put_attr(msg, off, IFLA_MTU, &mtu, sizeof(mtu));
+		off = put_attr(msg, off, IFLA_ADDRESS, mac, sizeof(mac));
+		nh->nlmsg_len = off;
+	} else if (req == RTM_GETADDR) {
+		struct ifaddrmsg ifa;
+		/* 127.0.0.1 in network byte order. */
+		unsigned char v4[4] = { 127, 0, 0, 1 };
+		const char *label = "lo";
+
+		memset(&ifa, 0, sizeof(ifa));
+		ifa.ifa_family = AF_INET;
+		ifa.ifa_prefixlen = 8;
+		ifa.ifa_flags = IFA_F_PERMANENT;
+		ifa.ifa_scope = RT_SCOPE_HOST;
+		ifa.ifa_index = 1;
+
+		nh = (struct nlmsghdr *) msg;
+		nh->nlmsg_type = RTM_NEWADDR;
+		nh->nlmsg_flags = NLM_F_MULTI;
+		nh->nlmsg_seq = seq;
+		nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
+		memcpy(NLMSG_DATA(nh), &ifa, sizeof(ifa));
+		off = NLMSG_LENGTH(sizeof(ifa));
+		off = put_attr(msg, off, IFA_ADDRESS, v4, sizeof(v4));
+		off = put_attr(msg, off, IFA_LOCAL, v4, sizeof(v4));
+		off = put_attr(msg, off, IFA_LABEL, label, strlen(label) + 1);
+		nh->nlmsg_len = off;
+	}
+	/* Anything else (a request type we do not model) falls through with
+	 * off == 0 and gets a bare DONE, which is a well-formed "nothing to
+	 * report" rather than a hang. */
+
+	/* Terminate the dump. NLM_F_MULTI is set on the payload messages
+	 * above, so the client keeps reading until it sees this. */
 	memset(&done, 0, sizeof(done));
-	done.nlmsg_len   = NLMSG_HDRLEN;
-	done.nlmsg_type  = NLMSG_DONE;
-	/* NLM_F_MULTI is deliberately NOT set: this is a single, complete
-	 * reply, not the tail of a multipart dump. Setting it would tell the
-	 * client to keep reading and it would block on a second message that
-	 * is never coming. */
+	done.nlmsg_len = NLMSG_HDRLEN;
+	done.nlmsg_type = NLMSG_DONE;
 	done.nlmsg_flags = 0;
-	/* Echo the request's sequence, and stamp OUR port id — not the
-	 * request's. The client compares the reply's pid against what its own
-	 * getsockname() reported (Go: netlink_linux.go NetlinkRIB, "m.Header.Pid
-	 * != lsanl.Pid -> EINVAL"), and a request is normally sent with
-	 * nlmsg_pid = 0 meaning "to the kernel". Copying that 0 back would fail
-	 * the comparison. */
-	done.nlmsg_seq   = slot >= 0 ? cfg->last_seq[slot] : 0;
-	done.nlmsg_pid   = FAKE_NETLINK_PORT_ID;
+	done.nlmsg_seq = seq;
+	done.nlmsg_pid = FAKE_NETLINK_PORT_ID;
 
-	if (write_data(tracee, buf, &done, NLMSG_HDRLEN) < 0) return -EFAULT;
-	return NLMSG_HDRLEN;
+	if (off + NLMSG_HDRLEN > sizeof(msg)) return -EINVAL;
+	memcpy(msg + off, &done, NLMSG_HDRLEN);
+	off += NLMSG_HDRLEN;
+
+	if (len < off) return -EINVAL;
+	if (write_data(tracee, buf, msg, off) < 0) return -EFAULT;
+	return (int) off;
 }
 
 /**
@@ -407,7 +512,7 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			 * is exactly what made this return EINVAL on device
 			 * despite emitting a correct NLMSG_DONE. */
 			if (get_sysnum(tracee, CURRENT) == PR_recvfrom) {
-				n = emit_done(tracee, cfg, rslot,
+				n = emit_dump_reply(tracee, cfg, rslot,
 					      peek_reg(tracee, CURRENT, SYSARG_2),
 					      peek_reg(tracee, CURRENT, SYSARG_3));
 			} else {
@@ -421,7 +526,7 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 						 sizeof(iov)) < 0)
 					n = -EFAULT;
 				else
-					n = emit_done(tracee, cfg, rslot,
+					n = emit_dump_reply(tracee, cfg, rslot,
 						      (word_t) iov.iov_base,
 						      (word_t) iov.iov_len);
 			}
