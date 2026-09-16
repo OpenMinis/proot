@@ -88,6 +88,11 @@ typedef struct {
 	 * (including Go's) discard the answer as unsolicited. */
 	uint32_t last_seq[FAKE_NETLINK_MAX_FDS];
 	uint32_t last_pid[FAKE_NETLINK_MAX_FDS];
+	/* [T-android-fake-netlink-monitor] True when bind() asked for multicast
+	 * groups, i.e. this is an EVENT-SUBSCRIPTION socket rather than a
+	 * request/response one. The two need opposite treatment on recv --
+	 * see the PR_bind and recv handling. */
+	bool is_monitor[FAKE_NETLINK_MAX_FDS];
 	/* Set while a socket() call is being converted, so the exit handler
 	 * knows to adopt the resulting fd. */
 	bool pending_socket;
@@ -113,6 +118,9 @@ static const FilteredSysnum filtered_sysnums[] = {
 	 * writable at exit. */
 	{ PR_getsockname, FILTER_SYSEXIT },
 	{ PR_close,	FILTER_SYSEXIT },
+	/* [T-android-fake-so-mark] Not tied to our fake fds -- see
+	 * handle_setsockopt_enter. */
+	{ PR_setsockopt, FILTER_SYSEXIT },
 	FILTERED_SYSNUM_END,
 };
 
@@ -138,6 +146,7 @@ static int claim_slot(FakeNetlinkConfig *cfg, int fd, int peer)
 			cfg->peer_fds[i] = peer;
 			cfg->last_seq[i] = 0;
 			cfg->last_pid[i] = 0;
+			cfg->is_monitor[i] = false;
 			return i;
 		}
 	}
@@ -273,6 +282,55 @@ static void adopt_socket_exit(Tracee *tracee, FakeNetlinkConfig *cfg)
 	poke_reg(tracee, SYSARG_RESULT, (word_t) pair[0]);
 }
 
+/**
+ * [T-android-fake-so-mark] Pretend `setsockopt(SOL_SOCKET, SO_MARK, …)`
+ * succeeded.
+ *
+ * SO_MARK stamps an fwmark on outbound packets so routing rules can match
+ * them. Setting it requires CAP_NET_ADMIN, which an unprivileged Android app
+ * can never hold, so the real kernel answers EPERM.
+ *
+ * Tailscale sets it to keep its own traffic from being routed back through
+ * its tunnel, and treats the failure as fatal: after the netlink emulation
+ * let tsnet get further, startup died at
+ *
+ *     wgengine: magicsock: Rebind IPv4 failed: failed to bind any ports
+ *
+ * which a per-sockopt probe traced to SO_MARK alone -- plain binds,
+ * SO_REUSEADDR/PORT, IP_PKTINFO, IP_RECVERR and IP_MTU_DISCOVER all succeed in
+ * the sandbox. The same probe fails identically OUTSIDE proot, confirming this
+ * is the kernel's rule and not something proot introduced.
+ *
+ * Reporting success is honest about the outcome rather than the mechanism: the
+ * mark exists to steer packets through policy routing that this sandbox has no
+ * way to install in the first place, so there is nothing for the caller to be
+ * misled about. A guest that genuinely depends on the mark taking effect is
+ * already unable to work here.
+ *
+ * Unlike the rest of this file, this is deliberately NOT restricted to fds we
+ * created: Tailscale sets SO_MARK on its ordinary UDP sockets, which are real
+ * kernel sockets we never touched. The narrowing is on the OPTION instead --
+ * every other level/optname is passed straight through to the kernel.
+ */
+static void handle_setsockopt_enter(Tracee *tracee)
+{
+	/* SO_MARK is 36 on Linux and is not always exposed by the NDK headers
+	 * for every API level, so it is spelled out rather than included. */
+	const int SOL_SOCKET_LINUX = 1;
+	const int SO_MARK_LINUX = 36;
+
+	if ((int) peek_reg(tracee, CURRENT, SYSARG_2) != SOL_SOCKET_LINUX) return;
+	if ((int) peek_reg(tracee, CURRENT, SYSARG_3) != SO_MARK_LINUX) return;
+
+	/* Void the call and report success. The result MUST be set here, at
+	 * enter: translate_syscall_exit() restores SYSARG_RESULT from the
+	 * MODIFIED register set for any PR_void'd syscall (syscall/exit.c:76-87),
+	 * and that runs after the extension's exit hook, so a poke_reg() from
+	 * there would be silently discarded. */
+	set_sysnum(tracee, PR_void);
+	poke_reg(tracee, SYSARG_RESULT, 0);
+}
+
 int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			  intptr_t data1 UNUSED, intptr_t data2 UNUSED)
 {
@@ -284,13 +342,14 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) {
 			cfg->fds[i] = -1;
 			cfg->peer_fds[i] = -1;
+			cfg->is_monitor[i] = false;
 		}
 
 		extension->config = cfg;
 		extension->filtered_sysnums = filtered_sysnums;
 
 		note(NULL, INFO, INTERNAL,
-		     "fake_netlink: initialized (RTM_GETLINK/RTM_GETADDR → empty list)");
+		     "fake_netlink: initialized (rtnetlink → empty list; SO_MARK → no-op)");
 		return 0;
 	}
 
@@ -302,6 +361,11 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 	case SYSCALL_ENTER_START: {
 		Tracee *tracee = TRACEE(extension);
 		FakeNetlinkConfig *cfg = extension->config;
+
+		if (get_sysnum(tracee, CURRENT) == PR_setsockopt) {
+			handle_setsockopt_enter(tracee);
+			return 0;
+		}
 
 		if (get_sysnum(tracee, CURRENT) == PR_socket)
 			return convert_socket_enter(tracee, cfg);
@@ -322,6 +386,16 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			int n;
 
 			if (rslot < 0) return 0;
+
+			/* [T-android-fake-netlink-monitor] An event-subscription
+			 * socket has nothing to report and never will: there is
+			 * no netlink underneath to generate a link event. The
+			 * honest answer is the one a real quiet system gives --
+			 * block. Letting the call through to the real kernel on
+			 * the empty AF_UNIX stand-in does exactly that, and it
+			 * blocks in a way the guest can still interrupt or
+			 * poll, unlike anything we could fabricate. */
+			if (cfg->is_monitor[rslot]) return 0;
 
 			/* Write the reply and set the result HERE, not at exit.
 			 *
@@ -386,13 +460,35 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 		if (slot < 0) return 0;	/* not one of ours */
 
 		switch (sysnum) {
-		case PR_bind:
+		case PR_bind: {
 			/* The guest binds to pick up a port/groups. There is
 			 * nothing to bind to, and the AF_UNIX fd underneath
 			 * would reject an AF_NETLINK sockaddr, so report the
-			 * success the guest is entitled to expect. */
+			 * success the guest is entitled to expect.
+			 *
+			 * [T-android-fake-netlink-monitor] While we are here,
+			 * read nl_groups to learn which KIND of socket this is.
+			 * A non-zero group mask means the caller subscribed to
+			 * asynchronous link/address events (Tailscale's link
+			 * monitor does this) rather than intending to send a
+			 * request. Those two want opposite things from recv,
+			 * and answering a monitor the way we answer a query is
+			 * what made tsnet spin: it got an immediate
+			 * NLMSG_DONE, logged "unhandled netlink msg type done",
+			 * looped, and burned CPU writing 14 MB of log in a
+			 * minute on device. */
+			struct sockaddr_nl nl;
+			word_t sa = peek_reg(tracee, ORIGINAL, SYSARG_2);
+			word_t salen = peek_reg(tracee, ORIGINAL, SYSARG_3);
+
+			if (sa != 0 && salen >= sizeof(nl)
+			    && read_data(tracee, &nl, sa, sizeof(nl)) >= 0
+			    && nl.nl_groups != 0) {
+				cfg->is_monitor[slot] = true;
+			}
 			poke_reg(tracee, SYSARG_RESULT, 0);
 			return 0;
+		}
 
 		case PR_sendto:
 		case PR_sendmsg:
