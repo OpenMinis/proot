@@ -77,6 +77,11 @@
 typedef struct {
 	/* Guest fd numbers we are emulating. -1 = free slot. */
 	int fds[FAKE_NETLINK_MAX_FDS];
+	/* The OTHER end of the socketpair backing each slot. Never read or
+	 * written -- recv is emulated at enter, so no data ever has to flow --
+	 * but kept recorded, and kept OPEN in the guest, because closing it
+	 * would make the guest's own end report EOF/hangup to any poller. */
+	int peer_fds[FAKE_NETLINK_MAX_FDS];
 	/* Sequence number and pid from the last request seen on each fd, so
 	 * the reply we synthesise echoes them back. A netlink client matches
 	 * replies on these; returning zeros makes well-written clients
@@ -86,6 +91,11 @@ typedef struct {
 	/* Set while a socket() call is being converted, so the exit handler
 	 * knows to adopt the resulting fd. */
 	bool pending_socket;
+	/* Capacity the caller passed to getsockname(), captured at ENTER.
+	 * By the time we run at EXIT the kernel has already overwritten
+	 * *optlen with ITS answer (2, for an unnamed AF_UNIX socket), so the
+	 * caller's real buffer size is unrecoverable at that point. */
+	socklen_t getsockname_capacity;
 } FakeNetlinkConfig;
 
 /* Syscalls we ask PRoot to stop on. Keeping this list tight matters: every
@@ -98,6 +108,9 @@ static const FilteredSysnum filtered_sysnums[] = {
 	{ PR_sendmsg,	FILTER_SYSEXIT },
 	{ PR_recvfrom,	FILTER_SYSEXIT },
 	{ PR_recvmsg,	FILTER_SYSEXIT },
+	/* getsockname needs BOTH: the caller's buffer capacity is only
+	 * readable at enter (see getsockname_capacity), the value is only
+	 * writable at exit. */
 	{ PR_getsockname, FILTER_SYSEXIT },
 	{ PR_close,	FILTER_SYSEXIT },
 	FILTERED_SYSNUM_END,
@@ -117,11 +130,12 @@ static int slot_of(const FakeNetlinkConfig *cfg, int fd)
 	return -1;
 }
 
-static int claim_slot(FakeNetlinkConfig *cfg, int fd)
+static int claim_slot(FakeNetlinkConfig *cfg, int fd, int peer)
 {
 	for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) {
 		if (cfg->fds[i] == -1) {
 			cfg->fds[i] = fd;
+			cfg->peer_fds[i] = peer;
 			cfg->last_seq[i] = 0;
 			cfg->last_pid[i] = 0;
 			return i;
@@ -248,7 +262,7 @@ static void adopt_socket_exit(Tracee *tracee, FakeNetlinkConfig *cfg)
 		return;
 	}
 
-	slot = claim_slot(cfg, pair[0]);
+	slot = claim_slot(cfg, pair[0], pair[1]);
 	if (slot < 0) {
 		/* Table full — refuse rather than hand back a socket we will
 		 * not recognise later and would therefore emulate wrongly. */
@@ -267,7 +281,10 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 		FakeNetlinkConfig *cfg = talloc_zero(extension, FakeNetlinkConfig);
 		if (cfg == NULL) return -ENOMEM;
 
-		for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) cfg->fds[i] = -1;
+			for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) {
+			cfg->fds[i] = -1;
+			cfg->peer_fds[i] = -1;
+		}
 
 		extension->config = cfg;
 		extension->filtered_sysnums = filtered_sysnums;
@@ -288,6 +305,68 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 
 		if (get_sysnum(tracee, CURRENT) == PR_socket)
 			return convert_socket_enter(tracee, cfg);
+
+		/* [blocking] recvfrom/recvmsg on our AF_UNIX stand-in would sleep
+		 * in the kernel forever: nothing ever writes to it, and a
+		 * ptrace exit-stop only happens once the syscall RETURNS. So
+		 * void the call at enter -- the kernel runs a harmless no-op --
+		 * and let the exit handler below fill in the reply. This is the
+		 * same PR_void mechanism fake_id0 uses to fully emulate a call.
+		 *
+		 * Verified on device: without this the guest hangs in recvfrom
+		 * and never completes net.Interfaces(). */
+		if (get_sysnum(tracee, CURRENT) == PR_recvfrom
+		    || get_sysnum(tracee, CURRENT) == PR_recvmsg) {
+			int rfd = (int) peek_reg(tracee, CURRENT, SYSARG_1);
+			int rslot = slot_of(cfg, rfd);
+			int n;
+
+			if (rslot < 0) return 0;
+
+			/* Write the reply and set the result HERE, not at exit.
+			 *
+			 * translate_syscall_exit() restores SYSARG_RESULT from
+			 * the MODIFIED register set for any PR_void'd syscall
+			 * (syscall/exit.c:76-87), and that runs AFTER the
+			 * extension's SYSCALL_EXIT_START. A poke_reg() from the
+			 * exit hook is therefore silently overwritten -- which
+			 * is exactly what made this return EINVAL on device
+			 * despite emitting a correct NLMSG_DONE. */
+			if (get_sysnum(tracee, CURRENT) == PR_recvfrom) {
+				n = emit_done(tracee, cfg, rslot,
+					      peek_reg(tracee, CURRENT, SYSARG_2),
+					      peek_reg(tracee, CURRENT, SYSARG_3));
+			} else {
+				struct msghdr msg;
+				struct iovec iov;
+				word_t msg_addr = peek_reg(tracee, CURRENT, SYSARG_2);
+
+				if (read_data(tracee, &msg, msg_addr, sizeof(msg)) < 0
+				    || msg.msg_iovlen < 1
+				    || read_data(tracee, &iov, (word_t) msg.msg_iov,
+						 sizeof(iov)) < 0)
+					n = -EFAULT;
+				else
+					n = emit_done(tracee, cfg, rslot,
+						      (word_t) iov.iov_base,
+						      (word_t) iov.iov_len);
+			}
+
+			set_sysnum(tracee, PR_void);
+			poke_reg(tracee, SYSARG_RESULT, (word_t) n);
+			return 0;
+		}
+
+		if (get_sysnum(tracee, CURRENT) == PR_getsockname) {
+			/* Snapshot the caller's capacity before the kernel
+			 * clobbers it with its own (much smaller) answer. */
+			word_t lenp = peek_reg(tracee, CURRENT, SYSARG_3);
+			socklen_t cap = 0;
+
+			cfg->getsockname_capacity = 0;
+			if (lenp != 0 && read_data(tracee, &cap, lenp, sizeof(cap)) >= 0)
+				cfg->getsockname_capacity = cap;
+		}
 		return 0;
 	}
 
@@ -295,7 +374,7 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 		Tracee *tracee = TRACEE(extension);
 		FakeNetlinkConfig *cfg = extension->config;
 		word_t sysnum = get_sysnum(tracee, ORIGINAL);
-		int fd, slot, status;
+		int fd, slot;
 
 		if (sysnum == PR_socket) {
 			if (cfg->pending_socket) adopt_socket_exit(tracee, cfg);
@@ -330,37 +409,12 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 				 peek_reg(tracee, ORIGINAL, SYSARG_3));
 			return 0;
 
-		case PR_recvfrom:
-			status = emit_done(tracee, cfg, slot,
-					   peek_reg(tracee, ORIGINAL, SYSARG_2),
-					   peek_reg(tracee, ORIGINAL, SYSARG_3));
-			poke_reg(tracee, SYSARG_RESULT, (word_t) status);
-			return 0;
-
-		case PR_recvmsg: {
-			/* Same reply as recvfrom, but the buffer is behind a
-			 * struct msghdr in guest memory, so read the first
-			 * iovec to find out where to write. Go's netlink code
-			 * uses recvfrom, so this path is for the C callers
-			 * (glibc/musl getifaddrs) that use recvmsg instead. */
-			struct msghdr msg;
-			struct iovec iov;
-			word_t msg_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
-
-			if (read_data(tracee, &msg, msg_addr, sizeof(msg)) < 0
-			    || msg.msg_iovlen < 1
-			    || read_data(tracee, &iov, (word_t) msg.msg_iov,
-					 sizeof(iov)) < 0) {
-				poke_reg(tracee, SYSARG_RESULT, (word_t) -EFAULT);
-				return 0;
-			}
-
-			status = emit_done(tracee, cfg, slot,
-					   (word_t) iov.iov_base,
-					   (word_t) iov.iov_len);
-			poke_reg(tracee, SYSARG_RESULT, (word_t) status);
-			return 0;
-		}
+		/* recvfrom/recvmsg are NOT handled here: they are voided and
+		 * answered at syscall ENTER (see above), because a voided call's
+		 * result is restored from the MODIFIED register set after this
+		 * hook runs, and because a blocking read on the AF_UNIX stand-in
+		 * would never return to give us an exit stop in the first place.
+		 */
 
 		case PR_getsockname: {
 			/* The underlying fd is AF_UNIX, so the real kernel
@@ -375,10 +429,12 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			socklen_t avail = 0;
 
 			if (addr == 0 || lenp == 0) return 0;
-			if (read_data(tracee, &avail, lenp, sizeof(avail)) < 0) {
-				poke_reg(tracee, SYSARG_RESULT, (word_t) -EFAULT);
-				return 0;
-			}
+			/* NOT read from *lenp: the kernel already replaced it
+			 * with the length IT wrote (2 for an unnamed AF_UNIX
+			 * socket), which is smaller than sockaddr_nl and would
+			 * make us wrongly refuse. Use what the caller asked
+			 * for, captured at enter. */
+			avail = cfg->getsockname_capacity;
 			if (avail < sizeof(nl)) {
 				poke_reg(tracee, SYSARG_RESULT, (word_t) -EINVAL);
 				return 0;
