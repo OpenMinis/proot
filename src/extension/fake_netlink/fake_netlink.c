@@ -53,6 +53,8 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
@@ -442,8 +444,14 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 		extension->config = cfg;
 		extension->filtered_sysnums = filtered_sysnums;
 
-		note(NULL, INFO, INTERNAL,
-		     "fake_netlink: initialized (rtnetlink → loopback only; SO_MARK → no-op)");
+		/* Debug only (same switch as native_offload's NOFF_DBG). As a
+		 * note(INFO) this printed at proot's default verbosity, on proot's
+		 * own stderr, at the top of every agent command's output. */
+		{
+			const char *dbg = getenv("MINIS_NOFF_DEBUG");
+			if (dbg != NULL && dbg[0] != '\0' && dbg[0] != '0')
+				fprintf(stderr, "[fake_netlink] initialized (rtnetlink -> loopback only; SO_MARK -> no-op)\n");
+		}
 		return 0;
 	}
 

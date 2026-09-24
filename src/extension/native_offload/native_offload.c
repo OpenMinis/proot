@@ -437,11 +437,14 @@ static void handle_execve_enter(Tracee *tracee, NativeOffloadConfig *cfg,
 		goto done;
 	}
 
+	/* Debug only. This used to be a note(INFO) as well, and INFO is printed
+	 * at proot's default verbosity: one "proot info: native_offload:
+	 * offloaded ..." line per offloaded command, written to proot's own
+	 * stderr - which the guest cannot redirect or grep away - so it landed
+	 * in every agent command's output and cost tokens. Failures above and
+	 * below stay WARNINGs. */
 	NOFF_DBG("offloaded '%s' -> tmpfile='%s' exit=%d",
 		 name, rsp.tmpfile, (int) rsp.exit_code);
-	note(tracee, INFO, INTERNAL,
-	     "native_offload: offloaded '%s' → tmpfile='%s' exit=%d",
-	     name, rsp.tmpfile, (int) rsp.exit_code);
 
 	status = rewrite_as_cat(tracee, filename_reg, argv_reg, rsp.tmpfile);
 	if (status < 0) {
@@ -485,9 +488,9 @@ int native_offload_callback(Extension *extension, ExtensionEvent event,
 			NOFF_DBG("initialized socket='%s' handlers=%d debug=on",
 				 cfg->socket_name ? cfg->socket_name : "(none)", count);
 		}
-		note(NULL, INFO, INTERNAL,
-		     "native_offload: initialized (socket='%s')",
-		     cfg->socket_name ? cfg->socket_name : "(none)");
+		/* No note(INFO) here: see the "offloaded" site - the startup line
+		 * showed up at the top of every agent command's output. The
+		 * NOFF_DBG above covers it when MINIS_NOFF_DEBUG is set. */
 		return 0;
 	}
 
