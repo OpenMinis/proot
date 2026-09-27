@@ -350,36 +350,55 @@ out:
 /* Write a NULL-terminated argv=["cat", <tmpfile>, NULL] into the
  * tracee's memory and point SYSARG_2 at it.  Rewrite SYSARG_1 to
  * "/bin/cat".  */
-static int rewrite_as_cat(Tracee *tracee, Reg filename_reg, Reg argv_reg,
-			  const char *tmpfile)
+/* Replace the intercepted execve with `path argv...` in the tracee. */
+static int rewrite_execve(Tracee *tracee, Reg filename_reg, Reg argv_reg,
+			  const char *path, const char *const *args, int nargs)
 {
-	static const char kCatPath[] = "/bin/cat";
-	static const char kCat[] = "cat";
-
-	int status = set_sysarg_data(tracee, kCatPath, sizeof(kCatPath), filename_reg);
+	int status = set_sysarg_data(tracee, path, strlen(path) + 1, filename_reg);
 	if (status < 0) return status;
 
-	size_t tlen = strlen(tmpfile) + 1;
-	word_t cat_addr = alloc_mem(tracee, sizeof(kCat));
-	if (cat_addr == 0) return -EFAULT;
-	if ((status = write_data(tracee, cat_addr, kCat, sizeof(kCat))) < 0) return status;
-
-	word_t tmp_addr = alloc_mem(tracee, tlen);
-	if (tmp_addr == 0) return -EFAULT;
-	if ((status = write_data(tracee, tmp_addr, tmpfile, tlen)) < 0) return status;
-
-	word_t argv_addr = alloc_mem(tracee, sizeof(word_t) * 3);
+	word_t argv_addr = alloc_mem(tracee, sizeof(word_t) * (nargs + 1));
 	if (argv_addr == 0) return -EFAULT;
 
-	word_t slot0 = cat_addr;
-	word_t slot1 = tmp_addr;
-	word_t slot2 = 0;
-	if ((status = write_data(tracee, argv_addr + 0 * sizeof(word_t), &slot0, sizeof(word_t))) < 0) return status;
-	if ((status = write_data(tracee, argv_addr + 1 * sizeof(word_t), &slot1, sizeof(word_t))) < 0) return status;
-	if ((status = write_data(tracee, argv_addr + 2 * sizeof(word_t), &slot2, sizeof(word_t))) < 0) return status;
+	for (int i = 0; i <= nargs; i++) {
+		word_t slot = 0;
+		if (i < nargs) {
+			size_t len = strlen(args[i]) + 1;
+			slot = alloc_mem(tracee, len);
+			if (slot == 0) return -EFAULT;
+			if ((status = write_data(tracee, slot, args[i], len)) < 0) return status;
+		}
+		if ((status = write_data(tracee, argv_addr + i * sizeof(word_t), &slot, sizeof(word_t))) < 0)
+			return status;
+	}
 
 	poke_reg(tracee, argv_reg, argv_addr);
 	return 0;
+}
+
+/*
+ * Turn the offloaded command into something that prints the handler's
+ * output and exits with the handler's status.
+ *
+ * It used to be `/bin/cat <tmpfile>` unconditionally, so the guest's `$?`
+ * was cat's 0 no matter what the handler returned: a failed image
+ * generation, a denied permission and a bad argument all looked like
+ * success to the shell - and to the agent reading the command's exit code.
+ * A non-zero status now runs `/bin/sh -c 'cat "$1"; exit N' sh <tmpfile>`,
+ * which prints the same bytes and then exits N. Exit 0 keeps plain cat, so
+ * the common path is unchanged.
+ */
+static int rewrite_as_result(Tracee *tracee, Reg filename_reg, Reg argv_reg,
+			     const char *tmpfile, int32_t exit_code)
+{
+	if (exit_code == 0) {
+		const char *args[] = { "cat", tmpfile };
+		return rewrite_execve(tracee, filename_reg, argv_reg, "/bin/cat", args, 2);
+	}
+	char script[48];
+	snprintf(script, sizeof(script), "cat \"$1\"; exit %d", (int) (exit_code & 0xff));
+	const char *args[] = { "sh", "-c", script, "sh", tmpfile };
+	return rewrite_execve(tracee, filename_reg, argv_reg, "/bin/sh", args, 5);
 }
 
 static void handle_execve_enter(Tracee *tracee, NativeOffloadConfig *cfg,
@@ -446,13 +465,13 @@ static void handle_execve_enter(Tracee *tracee, NativeOffloadConfig *cfg,
 	NOFF_DBG("offloaded '%s' -> tmpfile='%s' exit=%d",
 		 name, rsp.tmpfile, (int) rsp.exit_code);
 
-	status = rewrite_as_cat(tracee, filename_reg, argv_reg, rsp.tmpfile);
+	status = rewrite_as_result(tracee, filename_reg, argv_reg, rsp.tmpfile, rsp.exit_code);
 	if (status < 0) {
-		NOFF_DBG("rewrite_as_cat failed: %d (%s)", status, strerror(-status));
+		NOFF_DBG("rewrite_as_result failed: %d (%s)", status, strerror(-status));
 		note(tracee, WARNING, INTERNAL,
-		     "native_offload: rewrite_as_cat failed: %d", status);
+		     "native_offload: rewrite_as_result failed: %d", status);
 	} else {
-		NOFF_DBG("rewrote execve as /bin/cat %s", rsp.tmpfile);
+		NOFF_DBG("rewrote execve to print %s and exit %d", rsp.tmpfile, (int) rsp.exit_code);
 	}
 
 done:
