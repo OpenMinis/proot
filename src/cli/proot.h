@@ -68,6 +68,7 @@ static int handle_option_L(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_H(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_p(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_native_offload(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_fake_netlink(Tracee *tracee, const Cli *cli, const char *value);
 
 static int pre_initialize_bindings(Tracee *, const Cli *, size_t, char *const *, size_t);
 static int post_initialize_exe(Tracee *, const Cli *, size_t, char *const *, size_t);
@@ -294,6 +295,16 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
           .detail = "\tArg format: <socket-name>[:<handler>[,<handler>...]]\n"
                     "\tDefault socket name: native-offload.\n"
                     "\tExample: --native-offload=native-offload:apple-open,apple-copy",
+        },
+        { .class = "Extension options",
+          .arguments = {
+                { .name = "--fake-netlink", .separator = '\0', .value = NULL },
+                { .name = NULL, .separator = '\0', .value = NULL } },
+          .handler = handle_option_fake_netlink,
+          .description = "Emulate an rtnetlink socket, reporting an empty interface list.",
+          .detail = "\tAndroid's untrusted_app SELinux domain forbids AF_NETLINK, so\n"
+                    "\tnet.Interfaces() and friends fail with EPERM. This answers\n"
+                    "\tRTM_GETLINK/RTM_GETADDR with an empty list instead.\n",
         },
 	{ .class = "Alias options",
 	  .arguments = {

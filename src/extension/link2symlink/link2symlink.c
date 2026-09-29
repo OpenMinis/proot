@@ -203,6 +203,17 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
  *   with PREFIX, let the file be deleted, but also delete the
  *   symlink that was created and decremnt the count that is tacked
  *   to end of original file.
+ *
+ * openminis/openminis#375: the bookkeeping below runs as the REAL uid
+ * (-0 fakes root for the tracee only), so it genuinely fails when the
+ * containing directory is read-only -- Git chmods .git/objects/pack to
+ * 0555, which is how users hit this. Each raw libc call must therefore
+ * be converted to a negative errno before returning: these values are
+ * handed straight back to the tracee as the syscall result, and libc's
+ * bare -1 would be read as -EPERM regardless of the real failure. That
+ * is why `rm` reported "Operation not permitted" on a file the user
+ * plainly owned. notify_extensions() is left alone on purpose -- it
+ * already returns a proper negative errno.
  */
 static int decrement_link_count(Tracee *tracee, Reg sysarg)
 {
@@ -264,7 +275,7 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 
 		status = rename(final, new_final);
 		if (status < 0)
-			return status;
+			return errno > 0 ? -errno : -EPERM;
 		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
 		if (status < 0)
 			return status;
@@ -274,19 +285,19 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 		/* Symlink the intermediate to the final file.  */
 		status = unlink(intermediate);
 		if (status < 0)
-			return status;
+			return errno > 0 ? -errno : -EPERM;
 
 		status = symlink(final, intermediate);
 		if (status < 0)
-			return status;
+			return errno > 0 ? -errno : -EPERM;
 	} else {
 		/* If it is the last, delete the intermediate and final */
 		status = unlink(intermediate);
 		if (status < 0)
-			return status;
+			return errno > 0 ? -errno : -EPERM;
 		status = unlink(final);
 		if (status < 0)
-			return status;
+			return errno > 0 ? -errno : -EPERM;
 		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final, 0);
 		if (status < 0)
 			return status;
@@ -428,7 +439,7 @@ static int handle_sysexit_end(Tracee *tracee)
 
 		final_proc: status = lstat(final,&finalStat);
 		if (status < 0)
-			return status;
+			return errno > 0 ? -errno : -EPERM;
 
 		finalStat.st_nlink = atoi(final + strlen(final) - 4);
 

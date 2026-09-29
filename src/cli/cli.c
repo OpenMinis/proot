@@ -450,8 +450,28 @@ int main(int argc, char *const argv[])
 	Tracee *tracee;
 	int status;
 
-	/* Configure the memory allocator.  */
-	talloc_enable_leak_report();
+	/* Configure the memory allocator.
+	 *
+	 * The leak report is OPT-IN. talloc_enable_leak_report() installs an
+	 * atexit hook that dumps the whole allocation tree to stderr on every
+	 * exit — a few dozen "HandlerEntry contains N bytes" rows that are not
+	 * leaks at all, just proot's own syscall-handler registrations still
+	 * live at teardown.
+	 *
+	 * That is harmless for an interactive proot, and noise everywhere else.
+	 * Minis merges proot's stderr into the shell's stdout, so on any device
+	 * where the sandbox process exits per command (an aggressive OEM memory
+	 * manager killing the child between commands will do it) the dump is
+	 * captured as if it were command output: `pwd` comes back with several
+	 * KB of allocator tree attached. It has also actively hurt debugging —
+	 * proot prints its real error line FIRST and the tree then evicted it
+	 * from the capture buffer, which is why PersistentShell had to grow a
+	 * head+tail buffer to keep the cause visible.
+	 *
+	 * Gated on an env var so the diagnostic is still one `PROOT_TALLOC_REPORT=1`
+	 * away when someone actually wants it.  */
+	if (getenv("PROOT_TALLOC_REPORT") != NULL)
+		talloc_enable_leak_report();
 
 #if defined(TALLOC_VERSION_MAJOR) && TALLOC_VERSION_MAJOR >= 2
 	talloc_set_log_stderr();
