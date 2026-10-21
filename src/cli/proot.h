@@ -69,6 +69,7 @@ static int handle_option_H(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_p(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_native_offload(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_fake_netlink(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_xnet(Tracee *tracee, const Cli *cli, const char *value);
 
 static int pre_initialize_bindings(Tracee *, const Cli *, size_t, char *const *, size_t);
 static int post_initialize_exe(Tracee *, const Cli *, size_t, char *const *, size_t);
@@ -305,6 +306,16 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
           .detail = "\tAndroid's untrusted_app SELinux domain forbids AF_NETLINK, so\n"
                     "\tnet.Interfaces() and friends fail with EPERM. This answers\n"
                     "\tRTM_GETLINK/RTM_GETADDR with an empty list instead.\n",
+        },
+        { .class = "Extension options",
+          .arguments = {
+                { .name = "--xnet", .separator = '=', .value = "path" },
+                { .name = NULL, .separator = '\0', .value = NULL } },
+          .handler = handle_option_xnet,
+          .description = "Hand TCP connections the routes file hooks to the host app's router.",
+          .detail = "\tThe routes file (port4, port6, map, hook, exempt lines) is\n"
+                    "\twritten by the app; while it is missing, or the app's listener\n"
+                    "\tdoes not answer, every connection goes out directly.\n",
         },
 	{ .class = "Alias options",
 	  .arguments = {
