@@ -52,11 +52,4 @@ extern bool xnet_parse_prefix(const char *s, XnetPrefix *out);
  * multicast or link-local. An IPv4-mapped IPv6 address is matched as IPv4.  */
 extern bool xnet_should_forward(const XnetRoutes *r, int family, const uint8_t *addr);
 
-/* The socket inode in a /proc/<pid>/fd link ("socket:[12345]"), or 0.  */
-extern unsigned long xnet_socket_inode(const char *link);
-
-/* The local port of the socket with @inode in a /proc/net/tcp{,6} text,
- * or 0 when it is not listed.  */
-extern int xnet_local_port(const char *proc_net_tcp, unsigned long inode);
-
 #endif /* XNET_H */

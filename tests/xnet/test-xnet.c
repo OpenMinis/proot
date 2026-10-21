@@ -79,24 +79,6 @@ int main(void)
 	CHECK(!fwd(&r, "100.128.0.1"));
 	CHECK(!fwd(&r, "100.63.255.255"));
 
-	/* /proc parsing. */
-	CHECK(xnet_socket_inode("socket:[123456]") == 123456);
-	CHECK(xnet_socket_inode("pipe:[1]") == 0);
-	CHECK(xnet_socket_inode("/dev/null") == 0);
-	{
-		const char *tcp =
-			"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-			"   0: 0100007F:A0C8 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10123        0 777 1 0000000000000000 100 0 0 10 0\n"
-			"   1: 0100007F:D431 0100007F:A028 02 00000000:00000000 01:00000064 00000000 10123        0 123456 1 0000000000000000 100 0 0 10 0\n";
-		CHECK(xnet_local_port(tcp, 123456) == 0xD431);
-		CHECK(xnet_local_port(tcp, 777) == 0xA0C8);
-		CHECK(xnet_local_port(tcp, 999) == 0);
-		const char *tcp6 =
-			"  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
-			"   0: 0000000000000000FFFF00000100007F:C001 0000000000000000FFFF00000100007F:A028 01 00000000:00000000 00:00000000 00000000 10123        0 4242 1 0000000000000000 20 4 30 10 -1\n";
-		CHECK(xnet_local_port(tcp6, 4242) == 0xC001);
-	}
-
 	if (failures == 0)
 		printf("xnet helpers: all checks passed\n");
 	return failures == 0 ? 0 : 1;

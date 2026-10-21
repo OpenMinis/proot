@@ -16,9 +16,12 @@
  *      for an IPv6 destination), using a copy of the sockaddr on the
  *      tracee's stack - the guest's own buffer is never modified.
  *   3. When that connect() returns (0 or EINPROGRESS) the socket has a
- *      local port; the original destination is written to
- *      <map_dir>/<local port>, and the app's listener reads it to know where
- *      the connection was going, then routes and relays it.
+ *      local port: a getsockname() is chained after it (the guest still
+ *      sees connect()'s own result), and the original destination is
+ *      written to <map_dir>/<local port>; the app's listener reads it to
+ *      know where the connection was going, then routes and relays it.
+ *      (/proc/net/tcp would name the port too, but Android 10+ keeps it
+ *      from apps.)
  *
  * Falling back is the rule, never failing the guest's connection:
  *   - no routes file (the app turned forwarding off: direct route without
@@ -27,7 +30,10 @@
  *     -> picked up on the next connect(), by mtime + inode;
  *   - the app's listener does not answer (app killed, entry restarting) ->
  *     this connect() goes out directly, and forwarding pauses for
- *     XNET_RETRY_SECONDS before the listener is tried again.
+ *     XNET_RETRY_SECONDS before the listener is tried again. While it
+ *     answers it is probed at most once per XNET_ALIVE_SECONDS; and if a
+ *     redirected connect() is refused anyway, the guest's own connect() is
+ *     run again unchanged (direct).
  *
  * Routes file, one directive per line ('#' comments):
  *   port4 <n>        listener on 127.0.0.1
@@ -62,6 +68,7 @@
 #include <talloc.h>
 
 #include "extension/xnet/xnet.h"
+#include "syscall/chain.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
 #include "tracee/tracee.h"
@@ -83,6 +90,7 @@ typedef struct {
 #define XNET_MAX_FDS		4096
 #define XNET_RETRY_SECONDS	10
 #define XNET_PROBE_TIMEOUT_MS	150
+#define XNET_ALIVE_SECONDS	10
 
 /* --- Pure helpers ------------------------------------------------------ */
 
@@ -212,37 +220,6 @@ bool xnet_should_forward(const XnetRoutes *r, int family, const uint8_t *addr)
 	return true;
 }
 
-unsigned long xnet_socket_inode(const char *link)
-{
-	unsigned long ino = 0;
-
-	if (link == NULL || sscanf(link, "socket:[%lu]", &ino) != 1)
-		return 0;
-	return ino;
-}
-
-int xnet_local_port(const char *text, unsigned long inode)
-{
-	const char *line = text;
-
-	while (line != NULL && *line != '\0') {
-		const char *nl = strchr(line, '\n');
-		char local[64];
-		unsigned int port;
-		unsigned long ino;
-
-		/* sl local rem st tx:rx tr:when retrnsmt uid timeout inode */
-		if (sscanf(line, " %*s %63s %*s %*s %*s %*s %*s %*s %*s %lu", local, &ino) == 2
-		    && ino == inode) {
-			char *colon = strrchr(local, ':');
-			if (colon != NULL && sscanf(colon + 1, "%x", &port) == 1)
-				return (int) port;
-		}
-		line = nl ? nl + 1 : NULL;
-	}
-	return 0;
-}
-
 #ifndef XNET_PURE_ONLY
 /* --- State ------------------------------------------------------------- */
 
@@ -256,8 +233,10 @@ typedef struct {
 typedef struct {
 	XnetFds *fds;
 	bool pending;			/* this connect() was redirected */
+	bool awaiting_name;		/* our chained getsockname() is running */
 	int fd;
 	struct sockaddr_storage dest;	/* where the guest wanted to go */
+	word_t scratch;			/* tracee memory: sockaddr_storage + socklen_t */
 	uint32_t id;
 } XnetTracee;
 
@@ -268,6 +247,7 @@ static bool routes_valid;
 static struct timespec routes_mtime;
 static ino_t routes_ino;
 static time_t paused_until;
+static time_t alive_until;		/* the listener answered a probe recently */
 static uint32_t next_id;
 static bool debug_on;
 
@@ -331,6 +311,7 @@ static bool load_routes(void)
 	routes_mtime = st.st_mtim;
 	/* A new file is a new app state: try the listener again at once. */
 	paused_until = 0;
+	alive_until = 0;
 	DBG("routes %s: port4=%u port6=%u hook=%d exempt=%d\n", routes_valid ? "loaded" : "invalid",
 	    routes.port4, routes.port6, routes.n_hook, routes.n_exempt);
 	return routes_valid;
@@ -428,10 +409,13 @@ static void on_connect_enter(Tracee *tracee, XnetTracee *x)
 	if (now < paused_until)
 		return;
 	v6_listener = family == AF_INET6 && routes.port6 != 0;
-	if (!listener_alive(v6_listener ? AF_INET6 : AF_INET, v6_listener ? routes.port6 : routes.port4)) {
-		paused_until = now + XNET_RETRY_SECONDS;
-		DBG("listener not answering: direct for %ds\n", XNET_RETRY_SECONDS);
-		return;
+	if (now >= alive_until) {
+		if (!listener_alive(v6_listener ? AF_INET6 : AF_INET, v6_listener ? routes.port6 : routes.port4)) {
+			paused_until = now + XNET_RETRY_SECONDS;
+			DBG("listener not answering: direct for %ds\n", XNET_RETRY_SECONDS);
+			return;
+		}
+		alive_until = now + XNET_ALIVE_SECONDS;
 	}
 
 	{
@@ -464,6 +448,11 @@ static void on_connect_enter(Tracee *tracee, XnetTracee *x)
 		if (set_sysarg_data(tracee, &to, to_len, SYSARG_2) < 0)
 			return;
 		poke_reg(tracee, SYSARG_3, to_len);
+		/* Room for the chained getsockname() at exit (memory can only
+		 * be taken from the tracee's stack while in sysenter).  */
+		x->scratch = alloc_mem(tracee, sizeof(struct sockaddr_storage) + sizeof(socklen_t) + 8);
+		if (x->scratch == 0)
+			return;
 	}
 
 	x->pending = true;
@@ -473,75 +462,61 @@ static void on_connect_enter(Tracee *tracee, XnetTracee *x)
 	DBG("x%x fd %d -> app listener\n", x->id, fd);
 }
 
-/* Read a whole small /proc file.  */
-static char *slurp(const char *path, size_t max)
-{
-	char *buf = malloc(max + 1);
-	size_t total = 0;
-	int fd;
-
-	if (buf == NULL)
-		return NULL;
-	fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) {
-		free(buf);
-		return NULL;
-	}
-	for (;;) {
-		ssize_t n = read(fd, buf + total, max - total);
-		if (n <= 0)
-			break;
-		total += n;
-		if (total == max)
-			break;
-	}
-	close(fd);
-	buf[total] = '\0';
-	return buf;
-}
-
-static int local_port_of(pid_t pid, int fd)
-{
-	char path[64], link[64];
-	ssize_t n;
-	unsigned long inode;
-	const char *tables[] = { "/proc/net/tcp", "/proc/net/tcp6" };
-	int i, port = 0;
-
-	snprintf(path, sizeof(path), "/proc/%d/fd/%d", pid, fd);
-	n = readlink(path, link, sizeof(link) - 1);
-	if (n <= 0)
-		return 0;
-	link[n] = '\0';
-	inode = xnet_socket_inode(link);
-	if (inode == 0)
-		return 0;
-	for (i = 0; i < 2 && port == 0; i++) {
-		char *text = slurp(tables[i], 4 * 1024 * 1024);
-		if (text != NULL) {
-			port = xnet_local_port(text, inode);
-			free(text);
-		}
-	}
-	return port;
-}
-
+/* connect() to the listener returned: ask the socket's local port with a
+ * getsockname() chained after it; the guest gets connect()'s own result.  */
 static void on_connect_exit(Tracee *tracee, XnetTracee *x)
 {
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	socklen_t len = sizeof(struct sockaddr_storage);
+
+	x->pending = false;
+	if ((long) result == -ECONNREFUSED) {
+		/* The listener went away since the probe: run the guest's own
+		 * connect() again, unchanged - it goes out directly.  */
+		paused_until = time(NULL) + XNET_RETRY_SECONDS;
+		alive_until = 0;
+		DBG("x%x listener refused: retrying direct, paused %ds\n", x->id, XNET_RETRY_SECONDS);
+		(void) restart_original_syscall(tracee);
+		return;
+	}
+	if ((long) result != 0 && (long) result != -EINPROGRESS) {
+		DBG("x%x connect to the listener failed: %ld\n", x->id, (long) result);
+		return;
+	}
+	if (write_data(tracee, x->scratch + sizeof(struct sockaddr_storage), &len, sizeof(len)) < 0
+	    || register_chained_syscall(tracee, PR_getsockname, x->fd, x->scratch,
+					x->scratch + sizeof(struct sockaddr_storage), 0, 0, 0) < 0) {
+		DBG("x%x could not chain getsockname\n", x->id);
+		return;		/* the app closes a connection it cannot map */
+	}
+	force_chain_final_result(tracee, result);
+	x->awaiting_name = true;
+}
+
+/* The chained getsockname() returned: write the destination file.  */
+static void on_getsockname_exit(Tracee *tracee, XnetTracee *x)
+{
 	long result = (long) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	struct sockaddr_storage local;
 	char ip[INET6_ADDRSTRLEN], path[600], tmp[620], body[200];
 	uint16_t port;
 	int lport, fd;
 
-	x->pending = false;
-	if (result != 0 && result != -EINPROGRESS) {
-		DBG("x%x connect to the listener failed: %ld\n", x->id, result);
+	x->awaiting_name = false;
+	memset(&local, 0, sizeof(local));
+	if (result != 0 || read_data(tracee, &local, x->scratch, sizeof(local)) < 0) {
+		DBG("x%x getsockname failed: %ld\n", x->id, result);
 		return;
 	}
-	lport = local_port_of(tracee->pid, x->fd);
+	if (local.ss_family == AF_INET)
+		lport = ntohs(((struct sockaddr_in *) &local)->sin_port);
+	else if (local.ss_family == AF_INET6)
+		lport = ntohs(((struct sockaddr_in6 *) &local)->sin6_port);
+	else
+		lport = 0;
 	if (lport == 0) {
-		DBG("x%x local port not found\n", x->id);
-		return;		/* the app closes a connection it cannot map */
+		DBG("x%x no local port\n", x->id);
+		return;
 	}
 	if (x->dest.ss_family == AF_INET) {
 		struct sockaddr_in *in = (struct sockaddr_in *) &x->dest;
@@ -644,6 +619,15 @@ int xnet_callback(Extension *extension, ExtensionEvent event, intptr_t data1, in
 			on_socket_exit(tracee, x);
 		else if (sysnum == PR_connect && x->pending)
 			on_connect_exit(tracee, x);
+		return 0;
+	}
+
+	case SYSCALL_CHAINED_EXIT: {
+		Tracee *tracee = TRACEE(extension);
+		XnetTracee *x = extension->config;
+
+		if (x != NULL && x->awaiting_name)
+			on_getsockname_exit(tracee, x);
 		return 0;
 	}
 
