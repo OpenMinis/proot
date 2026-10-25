@@ -83,7 +83,7 @@ int main(void)
 	/* Prefix parsing. */
 	CHECK(xnet_parse_prefix("100.64.0.0/10", &p) && p.family == AF_INET && p.bits == 10);
 	CHECK(xnet_parse_prefix("fd7a:115c:a1e0::/48", &p) && p.family == AF_INET6 && p.bits == 48);
-	CHECK(xnet_parse_prefix("100.78.206.85", &p) && p.bits == 32);
+	CHECK(xnet_parse_prefix("100.64.0.42", &p) && p.bits == 32);
 	CHECK(!xnet_parse_prefix("100.64.0.0/33", &p));
 	CHECK(!xnet_parse_prefix("not-an-ip", &p));
 	CHECK(!xnet_parse_prefix("10.0.0.0/", &p));
@@ -100,9 +100,9 @@ int main(void)
 		"exempt 10.1.1.0/24\n", &r) == 0);
 	CHECK(r.port4 == 41000 && r.port6 == 41001 && strcmp(r.map_dir, "/data/x/map") == 0);
 	CHECK(r.n_hook == 2 && r.n_exempt == 1);
-	CHECK(fwd(&r, "100.78.206.85"));
+	CHECK(fwd(&r, "100.64.0.42"));
 	CHECK(fwd(&r, "fd7a:115c:a1e0::1"));
-	CHECK(fwd(&r, "::ffff:100.78.206.85"));		/* v4-mapped matched as v4 */
+	CHECK(fwd(&r, "::ffff:100.64.0.42"));		/* v4-mapped matched as v4 */
 	CHECK(!fwd(&r, "93.184.216.34"));			/* public: direct */
 	CHECK(!fwd(&r, "10.1.1.5"));				/* not hooked */
 
@@ -142,7 +142,7 @@ int main(void)
 	CHECK(r.n_udp_hook == 1 && r.n_resolver == 2 && r.dns && r.fail_closed);
 	{
 		uint8_t a[16];
-		inet_pton(AF_INET, "100.78.206.85", a);
+		inet_pton(AF_INET, "100.64.0.42", a);
 		CHECK(xnet_udp_should_forward(&r, AF_INET, a));
 		inet_pton(AF_INET, "93.184.216.34", a);
 		CHECK(!xnet_udp_should_forward(&r, AF_INET, a));	/* TCP hooks it, UDP not (proxy route) */
@@ -171,7 +171,7 @@ int main(void)
 		uint8_t h[32], a4[4], a6[16];
 		struct sockaddr_storage src;
 		socklen_t len;
-		inet_pton(AF_INET, "100.78.206.85", a4);
+		inet_pton(AF_INET, "100.64.0.42", a4);
 		CHECK(xnet_udp_header(h, AF_INET, a4, 53) == 10);
 		CHECK(h[3] == 1 && h[8] == 0 && h[9] == 53);
 		CHECK(xnet_parse_udp_header(h, 10, AF_INET, &src, &len) == 10);
@@ -185,7 +185,7 @@ int main(void)
 		CHECK(xnet_udp_header(h, AF_INET6, a6, 443) == 22);
 		CHECK(xnet_parse_udp_header(h, 22, AF_INET6, &src, &len) == 22
 		      && ((struct sockaddr_in6 *) &src)->sin6_port == htons(443));
-		inet_pton(AF_INET6, "::ffff:100.78.206.85", a6);
+		inet_pton(AF_INET6, "::ffff:100.64.0.42", a6);
 		CHECK(xnet_udp_header(h, AF_INET6, a6, 1) == 10);		/* v4-mapped sent as IPv4 */
 		CHECK(xnet_parse_udp_header(h, 9, AF_INET, &src, &len) == -1);	/* short */
 		h[2] = 1;
