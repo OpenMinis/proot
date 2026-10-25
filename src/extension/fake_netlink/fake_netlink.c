@@ -97,6 +97,20 @@ typedef struct {
 	 * request/response one. The two need opposite treatment on recv --
 	 * see the PR_bind and recv handling. */
 	bool is_monitor[FAKE_NETLINK_MAX_FDS];
+	/* [T-android-fake-netlink-write-request] The other end of each fd's
+	 * socketpair. busybox `ip` sends its dump request with write(), which
+	 * we do not trap (every guest write would pay a ptrace stop); the
+	 * datagram lands on this peer, and recv drains it from here. */
+	int peer[FAKE_NETLINK_MAX_FDS];
+	/* A request has been seen and not yet answered. Without one, recv
+	 * fails at once with EAGAIN instead of blocking or repeating. */
+	bool pending[FAKE_NETLINK_MAX_FDS];
+	/* The recv being rewritten between its enter and exit stop. */
+	int rx_slot;
+	word_t rx_buf;
+	word_t rx_len;
+	word_t rx_flags;
+	word_t rx_msg;	/* struct msghdr * for recvmsg, 0 for recvfrom */
 	/* Set while a socket() call is being converted, so the exit handler
 	 * knows to adopt the resulting fd. */
 	bool pending_socket;
@@ -151,6 +165,8 @@ static int claim_slot(FakeNetlinkConfig *cfg, int fd)
 			cfg->last_pid[i] = 0;
 			cfg->last_type[i] = 0;
 			cfg->is_monitor[i] = false;
+			cfg->peer[i] = -1;
+			cfg->pending[i] = false;
 			return i;
 		}
 	}
@@ -179,6 +195,7 @@ static void note_request(Tracee *tracee, FakeNetlinkConfig *cfg, int slot,
 	cfg->last_seq[slot] = hdr.nlmsg_seq;
 	cfg->last_pid[slot] = hdr.nlmsg_pid;
 	cfg->last_type[slot] = hdr.nlmsg_type;
+	cfg->pending[slot] = true;
 }
 
 /* Helper: append one attribute to a netlink message buffer. */
@@ -282,10 +299,32 @@ static int emit_dump_reply(Tracee *tracee, const FakeNetlinkConfig *cfg,
 		off = put_attr(msg, off, IFA_LOCAL, v4, sizeof(v4));
 		off = put_attr(msg, off, IFA_LABEL, label, strlen(label) + 1);
 		nh->nlmsg_len = off;
+	} else {
+		/* [T-android-fake-netlink-write-request] A request we do not
+		 * model (RTM_GETROUTE, RTM_GETNEIGH, ...) is refused at once
+		 * with an error, as iSH's stub does (deps/ish e13162b8): an
+		 * empty DONE read as "no routes" and exit 0, so
+		 * `ip route || fallback` never reached its fallback. */
+		struct nlmsgerr err;
+
+		memset(&err, 0, sizeof(err));
+		err.error = -EOPNOTSUPP;
+		err.msg.nlmsg_len = NLMSG_HDRLEN;
+		err.msg.nlmsg_type = req;
+		err.msg.nlmsg_seq = seq;
+		err.msg.nlmsg_pid = slot >= 0 ? cfg->last_pid[slot] : 0;
+
+		nh = (struct nlmsghdr *) msg;
+		nh->nlmsg_type = NLMSG_ERROR;
+		nh->nlmsg_flags = 0;
+		nh->nlmsg_seq = seq;
+		nh->nlmsg_pid = FAKE_NETLINK_PORT_ID;
+		memcpy(NLMSG_DATA(nh), &err, sizeof(err));
+		nh->nlmsg_len = NLMSG_LENGTH(sizeof(err));
+		if (len < nh->nlmsg_len) return -EINVAL;
+		if (write_data(tracee, buf, msg, nh->nlmsg_len) < 0) return -EFAULT;
+		return (int) nh->nlmsg_len;
 	}
-	/* Anything else (a request type we do not model) falls through with
-	 * off == 0 and gets a bare DONE, which is a well-formed "nothing to
-	 * report" rather than a hang. */
 
 	/* Terminate the dump. NLM_F_MULTI is set on the payload messages
 	 * above, so the client keeps reading until it sees this. */
@@ -369,6 +408,7 @@ static void adopt_socket_exit(Tracee *tracee, FakeNetlinkConfig *cfg)
 	 * enter, so no data has to flow), but closing it would make the
 	 * guest's own end report EOF/hangup to any poller. */
 	slot = claim_slot(cfg, pair[0]);
+	if (slot >= 0) cfg->peer[slot] = pair[1];
 	if (slot < 0) {
 		/* Table full — refuse rather than hand back a socket we will
 		 * not recognise later and would therefore emulate wrongly. */
@@ -428,6 +468,73 @@ static void handle_setsockopt_enter(Tracee *tracee)
 	poke_reg(tracee, SYSARG_RESULT, 0);
 }
 
+/**
+ * [T-android-fake-netlink-write-request] Finish a recv rewritten at enter.
+ *
+ * busybox `ip addr` hung here for ever, at 100% CPU (Pixel 6, 2026-10-18):
+ * its dump request goes out with write(), so the request was never noted,
+ * the reply carried seq 0, and busybox -- which compares seq and the sender's
+ * nl_pid -- skipped it as junk and called recvmsg again, which answered the
+ * same thing. iSH had the same hang and the same cure (deps/ish e13162b8):
+ * every request gets exactly one answer, the sender address is the kernel's,
+ * and with nothing asked a recv fails at once instead of waiting.
+ */
+static void answer_recv_exit(Tracee *tracee, FakeNetlinkConfig *cfg, int slot)
+{
+	int drained = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	struct sockaddr_nl from;
+	int n;
+
+	if (drained >= (int) sizeof(struct nlmsghdr))
+		note_request(tracee, cfg, slot, cfg->rx_buf, (word_t) drained);
+
+	if (!cfg->pending[slot]) {
+		poke_reg(tracee, SYSARG_RESULT, (word_t) -EAGAIN);
+		return;
+	}
+
+	n = emit_dump_reply(tracee, cfg, slot, cfg->rx_buf, cfg->rx_len);
+	if (n >= 0 && (cfg->rx_flags & MSG_PEEK) == 0)
+		cfg->pending[slot] = false;
+	if (n < 0) {
+		poke_reg(tracee, SYSARG_RESULT, (word_t) n);
+		return;
+	}
+
+	/* The sender is the kernel: nl_pid 0. Left unwritten, busybox reads
+	 * whatever was on its stack there and drops the reply. */
+	memset(&from, 0, sizeof(from));
+	from.nl_family = AF_NETLINK;
+
+	if (cfg->rx_msg == 0) {
+		word_t addr = peek_reg(tracee, ORIGINAL, SYSARG_5);
+		word_t lenp = peek_reg(tracee, ORIGINAL, SYSARG_6);
+		socklen_t cap, full = sizeof(from);
+
+		if (addr != 0 && lenp != 0
+		    && read_data(tracee, &cap, lenp, sizeof(cap)) >= 0) {
+			(void) write_data(tracee, addr, &from,
+					  cap < full ? cap : full);
+			(void) write_data(tracee, lenp, &full, sizeof(full));
+		}
+	} else {
+		struct msghdr msg;
+
+		if (read_data(tracee, &msg, cfg->rx_msg, sizeof(msg)) >= 0) {
+			if (msg.msg_name != NULL && msg.msg_namelen >= sizeof(from)) {
+				(void) write_data(tracee, (word_t) msg.msg_name,
+						  &from, sizeof(from));
+				msg.msg_namelen = sizeof(from);
+			} else {
+				msg.msg_namelen = 0;
+			}
+			msg.msg_flags = 0;
+			(void) write_data(tracee, cfg->rx_msg, &msg, sizeof(msg));
+		}
+	}
+	poke_reg(tracee, SYSARG_RESULT, (word_t) n);
+}
+
 int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			  intptr_t data1 UNUSED, intptr_t data2 UNUSED)
 {
@@ -439,7 +546,9 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++) {
 			cfg->fds[i] = -1;
 			cfg->is_monitor[i] = false;
+			cfg->peer[i] = -1;
 		}
+		cfg->rx_slot = -1;
 
 		extension->config = cfg;
 		extension->filtered_sysnums = filtered_sysnums;
@@ -508,26 +617,52 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 			 * exit hook is therefore silently overwritten -- which
 			 * is exactly what made this return EINVAL on device
 			 * despite emitting a correct NLMSG_DONE. */
+			word_t buf, len, msg_addr = 0;
+
 			if (get_sysnum(tracee, CURRENT) == PR_recvfrom) {
-				n = emit_dump_reply(tracee, cfg, rslot,
-					      peek_reg(tracee, CURRENT, SYSARG_2),
-					      peek_reg(tracee, CURRENT, SYSARG_3));
+				buf = peek_reg(tracee, CURRENT, SYSARG_2);
+				len = peek_reg(tracee, CURRENT, SYSARG_3);
 			} else {
 				struct msghdr msg;
 				struct iovec iov;
-				word_t msg_addr = peek_reg(tracee, CURRENT, SYSARG_2);
 
+				msg_addr = peek_reg(tracee, CURRENT, SYSARG_2);
 				if (read_data(tracee, &msg, msg_addr, sizeof(msg)) < 0
 				    || msg.msg_iovlen < 1
 				    || read_data(tracee, &iov, (word_t) msg.msg_iov,
-						 sizeof(iov)) < 0)
-					n = -EFAULT;
-				else
-					n = emit_dump_reply(tracee, cfg, rslot,
-						      (word_t) iov.iov_base,
-						      (word_t) iov.iov_len);
+						 sizeof(iov)) < 0) {
+					set_sysnum(tracee, PR_void);
+					poke_reg(tracee, SYSARG_RESULT, (word_t) -EFAULT);
+					return 0;
+				}
+				buf = (word_t) iov.iov_base;
+				len = (word_t) iov.iov_len;
 			}
 
+			/* [T-android-fake-netlink-write-request] Have the tracee
+			 * first drain a request written with write() from the
+			 * peer, without blocking, into the caller's own buffer;
+			 * the exit stop reads it, then answers. A request sent
+			 * with sendto/sendmsg was noted already and the drain
+			 * simply finds the peer empty. PRoot restores the
+			 * original argument registers at exit. */
+			if (cfg->peer[rslot] >= 0) {
+				cfg->rx_slot = rslot;
+				cfg->rx_buf = buf;
+				cfg->rx_len = len;
+				cfg->rx_flags = peek_reg(tracee, CURRENT, SYSARG_4);
+				cfg->rx_msg = msg_addr;
+				set_sysnum(tracee, PR_recvfrom);
+				poke_reg(tracee, SYSARG_1, (word_t) cfg->peer[rslot]);
+				poke_reg(tracee, SYSARG_2, buf);
+				poke_reg(tracee, SYSARG_3, len);
+				poke_reg(tracee, SYSARG_4, MSG_DONTWAIT);
+				poke_reg(tracee, SYSARG_5, 0);
+				poke_reg(tracee, SYSARG_6, 0);
+				return 0;
+			}
+
+			n = emit_dump_reply(tracee, cfg, rslot, buf, len);
 			set_sysnum(tracee, PR_void);
 			poke_reg(tracee, SYSARG_RESULT, (word_t) n);
 			return 0;
@@ -558,6 +693,12 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 		}
 
 		fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+		if (sysnum == PR_close && fd >= 0) {
+			/* A closed peer's number can be reused by any other
+			 * file; never drain from it again. */
+			for (int i = 0; i < FAKE_NETLINK_MAX_FDS; i++)
+				if (cfg->peer[i] == fd) cfg->peer[i] = -1;
+		}
 		slot = slot_of(cfg, fd);
 		if (slot < 0) return 0;	/* not one of ours */
 
@@ -607,12 +748,12 @@ int fake_netlink_callback(Extension *extension, ExtensionEvent event,
 				 peek_reg(tracee, ORIGINAL, SYSARG_3));
 			return 0;
 
-		/* recvfrom/recvmsg are NOT handled here: they are voided and
-		 * answered at syscall ENTER (see above), because a voided call's
-		 * result is restored from the MODIFIED register set after this
-		 * hook runs, and because a blocking read on the AF_UNIX stand-in
-		 * would never return to give us an exit stop in the first place.
-		 */
+		case PR_recvfrom:
+		case PR_recvmsg:
+			if (cfg->rx_slot != slot) return 0;	/* monitor: real blocking read */
+			cfg->rx_slot = -1;
+			answer_recv_exit(tracee, cfg, slot);
+			return 0;
 
 		case PR_getsockname: {
 			/* The underlying fd is AF_UNIX, so the real kernel

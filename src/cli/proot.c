@@ -30,6 +30,7 @@
 #include "extension/extension.h"
 #include "extension/sysvipc/sysvipc.h"
 #include "extension/fake_netlink/fake_netlink.h"
+#include "extension/xnet/xnet.h"
 #include "path/binding.h"
 #include "attribute.h"
 
@@ -349,6 +350,14 @@ static int handle_option_fake_netlink(Tracee *tracee, const Cli *cli UNUSED, con
 	int status = initialize_extension(tracee, fake_netlink_callback, value);
 	if (status < 0)
 		note(tracee, WARNING, INTERNAL, "fake-netlink not initialized");
+	return 0;
+}
+
+static int handle_option_xnet(Tracee *tracee, const Cli *cli UNUSED, const char *value)
+{
+	int status = initialize_extension(tracee, xnet_callback, value);
+	if (status < 0)
+		note(tracee, WARNING, INTERNAL, "xnet not initialized");
 	return 0;
 }
 
