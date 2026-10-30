@@ -27,7 +27,8 @@
 #include <sys/wait.h>   /* waitpid(2), */
 #include <sys/utsname.h> /* uname(2), */
 #include <unistd.h>     /* fork(2), chdir(2), getpid(2), */
-#include <string.h>     /* strcmp(3), */
+#include <string.h>     /* strcmp(3), strerror(3), */
+#include <stdio.h>      /* snprintf(3), */
 #include <errno.h>      /* errno(3), */
 #include <stdbool.h>    /* bool, true, false, */
 #include <assert.h>     /* assert(3), */
@@ -38,6 +39,7 @@
 #include "tracee/event.h"
 #include "tracee/seccomp.h"
 #include "tracee/mem.h"
+#include "tracee/diag.h"
 #include "cli/note.h"
 #include "path/path.h"
 #include "path/binding.h"
@@ -70,6 +72,10 @@ int launch_process(Tracee *tracee, char *const argv[])
 	if (tracee->verbose > 0)
 		list_open_fd(tracee);
 
+	/* Minis (FIX-261030-14): see tracee/diag.h.  After list_open_fd()
+	 * so the descriptor is not reported as a guest one.  */
+	proot_diag_open();
+
 	pid = fork();
 	switch(pid) {
 	case -1:
@@ -93,9 +99,36 @@ int launch_process(Tracee *tracee, char *const argv[])
 		kill(getpid(), SIGSTOP);
 
 		/* Improve performance by using seccomp mode 2, unless
-		 * this support is explicitly disabled.  */
-		if (getenv("PROOT_NO_SECCOMP") == NULL)
-			(void) enable_syscall_filtering(tracee);
+		 * this support is explicitly disabled.
+		 *
+		 * Minis (FIX-261030-14): the result used to be dropped, so a
+		 * filter that failed to install looked exactly like one that
+		 * worked.  Record which of the three it was (diagnostics
+		 * only: the flow below is unchanged).  This runs once per
+		 * proot process, in the first tracee before its execve.  */
+		if (getenv("PROOT_NO_SECCOMP") == NULL) {
+			int filter_status;
+			int filter_errno;
+			char line[160];
+
+			errno = 0;
+			filter_status = enable_syscall_filtering(tracee);
+			/* prctl() failures come back as -1 with errno set;
+			 * the other failures are already -errno.  */
+			filter_errno = (filter_status == -1 && errno > 0) ? errno : -filter_status;
+			if (filter_status < 0) {
+				snprintf(line, sizeof(line),
+					 "proot: seccomp acceleration unavailable (%d %s)",
+					 filter_errno, strerror(filter_errno));
+				proot_diag_line(line);
+			}
+			else if (!seccomp_filter_built_in())
+				proot_diag_line("proot: seccomp acceleration unavailable (built without seccomp filter support)");
+			else
+				proot_diag_line("proot: seccomp acceleration enabled (mode 2)");
+		}
+		else
+			proot_diag_line("proot: seccomp acceleration disabled by PROOT_NO_SECCOMP");
 
 		/* Now process is ptraced, so the current rootfs is already the
 		 * guest rootfs.  Note: Valgrind can't handle execve(2) on
@@ -646,6 +679,26 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 		case SIGSYS: {
 			siginfo_t siginfo = {};
 			ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &siginfo);
+
+			/* Minis (FIX-261030-14): evidence only, nothing below
+			 * changes.  The host's filter trapped a syscall proot
+			 * itself voided to SYSCALL_AVOIDER while the fast path
+			 * is off - the case where the "skip" logic depends on
+			 * seccomp_after_ptrace_enter being known.  "Off" is
+			 * seccomp_detected (no PTRACE_EVENT_SECCOMP seen yet in
+			 * this proot), not tracee->seccomp, which is not ENABLED
+			 * before a tracee's first seccomp event even on the fast
+			 * path.  */
+			if (siginfo.si_code == SYS_SECCOMP
+			    && siginfo.si_syscall == SYSCALL_AVOIDER
+			    && !seccomp_detected) {
+				static bool avoider_trap_logged = false;
+				if (!avoider_trap_logged) {
+					avoider_trap_logged = true;
+					proot_diag_line("proot: trapped syscall -1 (SYSCALL_AVOIDER) with seccomp acceleration off — syscall would have been translated on the fast path");
+				}
+			}
+
 			if (siginfo.si_code == SYS_SECCOMP) {
 				/* Signal cannot happen when we're inside syscall,
 				 * tracee would have to exit from syscall first.

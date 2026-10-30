@@ -511,6 +511,12 @@ int enable_syscall_filtering(const Tracee *tracee)
 	return 0;
 }
 
+/* Minis (FIX-261030-14): see the !HAVE_SECCOMP_FILTER variant below.  */
+bool seccomp_filter_built_in(void)
+{
+	return true;
+}
+
 #else
 
 #include "tracee/tracee.h"
@@ -519,6 +525,13 @@ int enable_syscall_filtering(const Tracee *tracee)
 int enable_syscall_filtering(const Tracee *tracee UNUSED)
 {
 	return 0;
+}
+
+/* Minis (FIX-261030-14): enable_syscall_filtering() "succeeds" here without
+ * installing anything, so the diagnostics must not call that "enabled".  */
+bool seccomp_filter_built_in(void)
+{
+	return false;
 }
 
 #endif /* defined(HAVE_SECCOMP_FILTER) */
