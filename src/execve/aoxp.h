@@ -69,6 +69,7 @@ extern int find_xpointee(ArrayOfXPointers *array, const void *reference);
 extern int resize_array_of_xpointers(ArrayOfXPointers *array, size_t index, ssize_t nb_delta_entries);
 extern int fetch_array_of_xpointers(Tracee *tracee, ArrayOfXPointers **array, Reg reg, size_t nb_entries);
 extern int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg);
+extern void last_push_of_xpointers(size_t *size, word_t *address);
 
 extern int read_xpointee_as_object(ArrayOfXPointers *array, size_t index, void **object);
 extern int read_xpointee_as_string(ArrayOfXPointers *array, size_t index, char **string);

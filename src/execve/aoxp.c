@@ -345,6 +345,19 @@ int fetch_array_of_xpointers(Tracee *tracee, ArrayOfXPointers **array_, Reg reg,
 	return 0;
 }
 
+/* Minis (FIX-261031-12, 1c): size and address of the block the last
+ * push_array_of_xpointers() call allocated (0 / 0 until it got that
+ * far), so a caller whose push failed can say where it was writing.
+ * Read only on that failure path; the tracer is single-threaded.  */
+static size_t last_push_size = 0;
+static word_t last_push_ptr = 0;
+
+void last_push_of_xpointers(size_t *size, word_t *address)
+{
+	*size = last_push_size;
+	*address = last_push_ptr;
+}
+
 /**
  * Copy @array into tracee's memory space, then put in @reg the
  * address where it was copied.  This function returns -errno if an
@@ -360,6 +373,9 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 	word_t tracee_ptr;
 	int status;
 	size_t i;
+
+	last_push_size = 0;
+	last_push_ptr = 0;
 
 	/* Nothing to do, for sure.  */
 	if (array == NULL)
@@ -410,6 +426,7 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 	if (local_count == 1)
 		return 0;
 	assert(local_count < array->length + 1);
+	last_push_size = total_size;
 
 	/* Modified pointees and the pod array are stored in a tracee's
 	 * memory block.  */
@@ -446,6 +463,7 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 	}
 
 	/* Write all the modified pointees and the pod array at once.  */
+	last_push_ptr = tracee_ptr;
 	status = writev_data(tracee, tracee_ptr, local, local_count);
 	if (status < 0)
 		return status;
