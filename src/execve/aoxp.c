@@ -413,7 +413,23 @@ int push_array_of_xpointers(ArrayOfXPointers *array, Reg reg)
 
 	/* Modified pointees and the pod array are stored in a tracee's
 	 * memory block.  */
+#if defined(ARCH_ARM64)
+	/* Minis (FIX-261031-12): AArch64 wants SP 16-byte aligned, and
+	 * this block (8 bytes per pointer + the strings) is any size, so
+	 * the argv[] table of a script landed at mod16 = 1, 9, ...  Pad
+	 * below the block the way upstream 28baec5 pads the load script
+	 * in execve/exit.c: the returned address itself is aligned, the
+	 * padding sits between the end of the data and the old SP and is
+	 * never written or referenced, and every offset inside the block
+	 * stays relative to its start.  RED_ZONE_SIZE is 0 on AArch64, so
+	 * alloc_mem() takes exactly this size.  */
+	{
+		const word_t stack_pointer = peek_reg(tracee, CURRENT, STACK_POINTER);
+		tracee_ptr = alloc_mem(tracee, total_size + (stack_pointer - total_size) % 16);
+	}
+#else
 	tracee_ptr = alloc_mem(tracee, total_size);
+#endif
 	if (tracee_ptr == 0)
 		return -E2BIG;
 
