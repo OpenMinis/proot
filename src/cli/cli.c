@@ -504,6 +504,14 @@ int main(int argc, char *const argv[])
 	if (NULL == getenv("PROOT_NO_MOUNTINFO"))
 		initialize_extension(tracee, mountinfo_callback, NULL);
 
+	/* Initialized last, so it is first in the extension list: its
+	 * HOST_PATH answer must reach fake_id0 before fake_id0 chmods a
+	 * protected path, and its SYSCALL_ENTER_END must refuse a write before
+	 * link2symlink acts on it.  */
+	if (getenv("PROOT_READONLY_PATHS") != NULL
+	    && initialize_extension(tracee, readonly_paths_callback, getenv("PROOT_READONLY_PATHS")) < 0)
+		note(tracee, WARNING, INTERNAL, "readonly-paths not initialized");
+
 	/* Start the first tracee.  */
 	status = launch_process(tracee, &argv[status]);
 	if (status < 0) {

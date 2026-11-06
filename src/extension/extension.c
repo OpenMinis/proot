@@ -166,4 +166,23 @@ void inherit_extensions(Tracee *child, Tracee *parent, word_t clone_flags)
 						(intptr_t)parent_extension, clone_flags);
 		}
 	}
+
+	/* Every new extension went to the head of the child's list, so the
+	 * child runs them in the reverse of its parent's order (and a
+	 * grandchild in the parent's order again).  readonly_paths has to see
+	 * HOST_PATH before fake_id0 makes a path writable and
+	 * SYSCALL_ENTER_END before link2symlink moves a file, in every
+	 * generation: put it back at the head.  */
+	if (child->extensions != NULL) {
+		Extension *extension;
+		LIST_FOREACH(extension, child->extensions, link) {
+			if (extension->callback == readonly_paths_callback) {
+				if (extension != LIST_FIRST(child->extensions)) {
+					LIST_REMOVE(extension, link);
+					LIST_INSERT_HEAD(child->extensions, extension, link);
+				}
+				break;
+			}
+		}
+	}
 }

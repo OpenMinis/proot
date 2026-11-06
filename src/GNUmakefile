@@ -78,6 +78,7 @@ OBJECTS += \
 	extension/fake_id0/fake_id0.o \
 	extension/hidden_files/hidden_files.o \
 	extension/mountinfo/mountinfo.o \
+	extension/readonly_paths/readonly_paths.o \
 	extension/port_switch/port_switch.o \
 	extension/sysvipc/sysvipc.o \
 	extension/sysvipc/sysvipc_msg.o \
